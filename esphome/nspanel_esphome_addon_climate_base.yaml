@@ -478,17 +478,19 @@ script:
       - lambda: |-
           ESP_LOGV("${TAG_ADDON_CLIMATE}", "Update climate chip");
           render_climate_chip->execute(static_cast<int>(thermostat_embedded->action),
-                                       static_cast<int>(thermostat_embedded->mode));
+                                       static_cast<int>(thermostat_embedded->mode), false);
 
   # Draws the climate chip and the target icon on the climate page for an action and a mode
   - id: render_climate_chip
     mode: single
     parameters:
-      action: int  # nspanel_easy::ClimateAction
-      mode: int    # nspanel_easy::ClimateMode
+      action: int             # nspanel_easy::ClimateAction
+      mode: int               # nspanel_easy::ClimateMode
+      cooling_blocked: bool   # Cooling is requested but blocked by the add-on (e.g. dew-point protection): shown as an alert
     then:
       - lambda: |-
-          ESP_LOGV("${TAG_ADDON_CLIMATE}", "Render climate chip: action=%d mode=%d", action, mode);
+          ESP_LOGV("${TAG_ADDON_CLIMATE}", "Render climate chip: action=%d mode=%d cooling blocked=%s",
+                   action, mode, YESNO(cooling_blocked));
           ESP_LOGV("${TAG_ADDON_CLIMATE}", "  visibility: %" PRIu8, id(climate_chip_visibility));
 
           // Determine visibility based on user preference and current climate state
@@ -512,7 +514,11 @@ script:
           const char* icon = Icons::MDI_NONE;
           uint16_t color = Colors::RGB565_BLACK;
 
-          if (is_active) {
+          if (cooling_blocked && action == nspanel_easy::CLIMATE_ACTION_COOLING) {
+            // Handle cooling requested but blocked: an alert, so the reason for the closed valve is visible
+            icon =  Icons::MDI_SNOWFLAKE_ALERT;
+            color = Colors::RGB565_ORANGE;
+          } else if (is_active) {
             // Handle actively running states (heating/cooling/drying/fan)
             icon =  climate_action_icons[action].icon;
             color = climate_action_icons[action].color;

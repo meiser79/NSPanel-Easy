@@ -261,7 +261,7 @@ How it works:
   If the current cycle already had a pulse, a changed output waits for the start of the next cycle.
   A new cycle that switches a relay on also waits until that relay has been off for the minimum off-time, which matters when it is longer than the PWM period.
   With `dual`, each relay is checked on its own, also when the cycle changes from heating to cooling.
-  Switching the room off, changing the operating mode and the boost apply immediately.
+  Switching the room off, changing the operating mode, the boost and a block by the [dew-point protection](#pid-dew-point-protection) apply immediately.
 - The controllers regulate on the same temperature as the thermostat, so they follow the calibration reference as described in [Temperature source](#temperature-source).
 - The regulation runs entirely on the panel and keeps working without Home Assistant.
 - While a controller is off, its integral term is kept, so it continues from the learned value when switched on again.
@@ -308,8 +308,9 @@ How it works:
 
 > [!CAUTION]
 > When cooling through the floor, surfaces below the dew point collect condensation, which can damage the floor and building.
-> The PID packages do not monitor the dew point: the controllers, and the boost of the single package, open the valve regardless of humidity.
+> By default, the PID packages do not monitor the dew point: the controllers, and the boost of the single package, open the valve regardless of humidity.
 > Cooling requires dew-point protection on the heating system side, e.g. in the heat pump or at the manifold.
+> The optional [PID dew-point protection](#pid-dew-point-protection) adds a second safeguard on the panel, but does not replace it.
 
 ### PID configuration
 
@@ -346,6 +347,9 @@ In PID mode, the deadband and overrun keys of the thermostat only affect the act
 | pid_eco_temp | single | Optional | Number in `temp_units` | `18` (°C) or `64` (°F) | Temperature of the `Eco` preset until `pid_eco_entity` has reported a value. |
 | pid_preset_buttons | single | Optional | `true` or `false` | `true` | Show `Comfort` and `Eco` as buttons on the climate page instead of the preset picker. |
 | pid_number_mode | both | Optional | `box` or `slider` | `box` | Input mode of the number entities in Home Assistant: type a value or use a slider. |
+| pid_dew_humidity_entity | both | Optional | Entity ID in Home Assistant or `""` | `""` (off) | Sensor with the room's relative humidity in %. Enables the [dew-point protection](#pid-dew-point-protection). |
+| pid_dew_surface_entity | both | Optional | Entity ID in Home Assistant or `""` | `""` (setpoint) | Sensor with the flow or floor temperature, in `temp_units`, compared with the dew point instead of the cooling setpoint. |
+| pid_dew_margin | both | Optional | Number in Kelvin | `2.0` | Minimum distance above the dew point. Also in Kelvin when `temp_units` is `°F`. |
 | pid_name_* | both | Optional | String | English names, see below | Entity names, e.g. to localize them or to keep existing entity IDs. |
 
 <!-- markdownlint-enable MD013 MD033 -->
@@ -367,6 +371,7 @@ Changes are applied immediately, without reflashing.
 | PID Cool output | `pid_name_cool_output` | Diagnostic | Output of the cool controller (0-100 %). |
 | PID Heat integral | `pid_name_heat_integral` | Diagnostic | Integral term of the heat controller. |
 | PID Cool integral | `pid_name_cool_integral` | Diagnostic | Integral term of the cool controller. |
+| PID Dew point protection | `pid_name_dew_protection` | - | On while the [dew-point protection](#pid-dew-point-protection) blocks cooling. Only available when it is configured. |
 | PID Operating mode | `pid_name_mode` | Diagnostic | *Single only:* operating mode currently used by the panel. |
 | PID Boost | `pid_name_boost` | - | *Single only:* switch opening the valve fully for the boost duration, see below. |
 | PID Boost duration | `pid_name_boost_duration` | Config | *Single only:* boost duration in minutes (`5` to `240`). |
@@ -392,6 +397,35 @@ number:
 
 They then appear as `PID Min on time` and `PID Min off time` (names set by `pid_name_min_on_time` and `pid_name_min_off_time`), in seconds from `pid_min_time_limit` to `900`.
 With `restore_value: true`, the substitutions only seed the first boot, like the other tuning entities.
+
+### PID dew-point protection
+
+For systems without dew-point protection on the heating system side, the panel can block cooling itself.
+Set `pid_dew_humidity_entity` to a humidity sensor in the room to enable it.
+
+The panel calculates the dew point from the room temperature and the humidity.
+Cooling is blocked while the cooling setpoint is less than `pid_dew_margin` above the dew point,
+and released again once it is 0.5 K further above it.
+With `pid_dew_surface_entity`, the flow or floor temperature is used instead of the cooling setpoint.
+This is more accurate: while cooling, the floor surface is colder than the room, so the setpoint is only an estimate.
+
+While cooling is blocked:
+
+- the cool output is held at 0 %, so the valve stays closed. A running cooling pulse is ended right away, regardless of the minimum on-time.
+  In the dual package, heating can still run.
+- the integral term of the cool controller does not grow, so the valve does not open fully when cooling is released.
+- *Single only:* the boost is ended in cooling mode and cannot be started.
+- the climate chip and the icon on the climate page show an orange snowflake with an exclamation mark while cooling is requested,
+  also with the default chip visibility (only while active).
+- **PID Dew point protection** is on in Home Assistant.
+
+The protection fails safe: cooling is also blocked after a boot until the values have arrived,
+while a sensor is `unavailable` or has no number, and while Home Assistant has been unavailable for longer than `api_stale_grace_period` (30 seconds by default).
+Heating is never blocked.
+
+> [!NOTE]
+> The panel does not know how long ago a sensor last reported.
+> A sensor that stops working but keeps its last value in Home Assistant is still used, so make sure it becomes `unavailable` when it fails.
 
 ### PID boost (single only)
 

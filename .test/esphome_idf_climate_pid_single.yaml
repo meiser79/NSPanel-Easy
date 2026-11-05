@@ -1,6 +1,8 @@
 ---
 substitutions:
   valve_relay: "1"
+  pid_dew_humidity_entity: sensor.room_humidity      # Builds the dew-point protection
+  pid_dew_surface_entity: sensor.floor_temperature  # With the surface temperature
 
 packages:
   idf_common: !include esphome_idf_common.yaml

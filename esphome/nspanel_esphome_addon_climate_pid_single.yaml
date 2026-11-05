@@ -116,6 +116,7 @@ text_sensor:
           pid_cool_embedded->reset_integral_term();
           id(pid_heat_integral_stored) = 0.0f;
           id(pid_cool_integral_stored) = 0.0f;
+          if (!std::isnan(id(pid_dew_cool_integral))) id(pid_dew_cool_integral) = 0.0f;  // Dew-point protection holds 0
           nspanel_easy::pid_pwm_cycle.force_level(0.0f, nspanel_easy::PID_PWM_CHANNEL_NONE);
       - script.execute: pid_sync
       - component.update: pid_mode_active
@@ -192,7 +193,10 @@ output:
     write_action:
       - lambda: |-
           if (id(pid_boost_active)) return;  // The boost owns the valve
-          if (id(pid_cooling_mode)) nspanel_easy::pid_pwm_cycle.set_level(state, nspanel_easy::PID_PWM_CHANNEL_COOL);
+          if (id(pid_cooling_mode)) {
+            // Dew-point protection: no cooling demand while it blocks cooling
+            nspanel_easy::pid_pwm_cycle.set_level(id(pid_dew_blocked) ? 0.0f : state, nspanel_easy::PID_PWM_CHANNEL_COOL);
+          }
 
 script:
   ###################################################################################################
@@ -216,9 +220,11 @@ script:
           if (room_on && id(pid_boost_active)) {  // Boost: the valve is open regardless of the controller
             action = cooling ? nspanel_easy::CLIMATE_ACTION_COOLING : nspanel_easy::CLIMATE_ACTION_HEATING;
           }
-          ESP_LOGV("${TAG_ADDON_CLIMATE_PID}", "Climate chip: mode=%u action=%u",
-                   static_cast<unsigned>(mode), static_cast<unsigned>(action));
-          render_climate_chip->execute(action, mode);
+          // Dew-point protection withholds the cooling the controller asks for: shown as an alert instead
+          const bool cooling_blocked = (action == nspanel_easy::CLIMATE_ACTION_COOLING) && id(pid_dew_blocked);
+          ESP_LOGV("${TAG_ADDON_CLIMATE_PID}", "Climate chip: mode=%u action=%u cooling blocked=%s",
+                   static_cast<unsigned>(mode), static_cast<unsigned>(action), YESNO(cooling_blocked));
+          render_climate_chip->execute(action, mode, cooling_blocked);
 
   # Refreshes the climate chip when the embedded thermostat is the panel's main climate entity
   - id: pid_refresh_chip
@@ -383,10 +389,12 @@ script:
     then:
       - if:
           condition:
-            lambda: return thermostat_embedded->mode == climate::CLIMATE_MODE_OFF;
+            lambda: |-
+              return thermostat_embedded->mode == climate::CLIMATE_MODE_OFF || (id(pid_cooling_mode) && id(pid_dew_blocked));
           then:
             - lambda: |-
-                ESP_LOGW("${TAG_ADDON_CLIMATE_PID}", "Boost ignored: room is off");
+                ESP_LOGW("${TAG_ADDON_CLIMATE_PID}", "Boost ignored: %s",
+                         thermostat_embedded->mode == climate::CLIMATE_MODE_OFF ? "room is off" : "dew-point protection");
                 id(pid_boost_switch).publish_state(false);
             - script.execute: pid_refresh_boost_ui
           else:
@@ -427,9 +435,10 @@ script:
           id(pid_boost_switch).publish_state(false);
           id(pid_boost_end_time).publish_state("");
           const bool room_on = (thermostat_embedded->mode != climate::CLIMATE_MODE_OFF);
+          const bool dew_blocked = id(pid_cooling_mode) && id(pid_dew_blocked);
           const float output = id(pid_cooling_mode) ? -pid_cool_embedded->get_output_value()
                                                     : pid_heat_embedded->get_output_value();
-          const float level = room_on ? std::min(1.0f, std::max(0.0f, output)) : 0.0f;
+          const float level = (room_on && !dew_blocked) ? std::min(1.0f, std::max(0.0f, output)) : 0.0f;
           nspanel_easy::pid_pwm_cycle.force_level(
               level, id(pid_cooling_mode) ? nspanel_easy::PID_PWM_CHANNEL_COOL : nspanel_easy::PID_PWM_CHANNEL_HEAT);
           ESP_LOGI("${TAG_ADDON_CLIMATE_PID}", "Boost ended, valve back to controller (%.0f %%)", level * 100.0f);
@@ -447,6 +456,18 @@ script:
           } else if (!on && relay_${valve_relay}->state) {
             relay_${valve_relay}->turn_off();
           }  // if (on && !relay_${valve_relay}->state)
+
+  # Dew-point protection: closes the valve right away and ends a cooling boost when it blocks cooling.
+  # The PWM cycle only latches a new level at the start of a cycle, so the running pulse is ended with
+  # force_level, regardless of the minimum on-time. When it releases, the next controller sample sets the
+  # level again, which an idle cycle starts right away (after the minimum off-time).
+  - id: !extend pid_dew_changed
+    then:
+      - lambda: |-
+          if (!id(pid_cooling_mode) || !id(pid_dew_blocked)) return;
+          if (id(pid_boost_active)) pid_boost_stop->execute();
+          nspanel_easy::pid_pwm_cycle.force_level(0.0f, nspanel_easy::PID_PWM_CHANNEL_NONE);
+      - script.execute: pid_refresh_chip
 
   # Validates the relay selection at build time
   - id: !extend dump_config

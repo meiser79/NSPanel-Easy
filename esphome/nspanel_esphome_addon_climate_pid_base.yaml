@@ -32,6 +32,10 @@ substitutions:
   pid_sync_interval: "10"       # Seconds between syncs thermostat -> PID controllers
   pid_sample_interval: "30"     # Seconds between PID computations, so the output averaging covers a fixed time
   pid_number_mode: "box"        # Input mode of the number entities in HA: "box" (type a value) or "slider"
+  ### Dew-point protection for cooling (optional, off while pid_dew_humidity_entity is "") ###
+  pid_dew_humidity_entity: ""   # HA sensor with the room's relative humidity (%), or "" to disable the protection
+  pid_dew_surface_entity: ""    # HA sensor with the flow or floor temperature (in temp_units), or "" to use the cooling setpoint
+  pid_dew_margin: "2.0"         # Minimum distance above the dew point in Kelvin (also when temp_units is °F)
   ### Entity names (override to keep existing entity IDs or to localize) ###
   pid_name_heat_output: "PID Heat output"
   pid_name_cool_output: "PID Cool output"
@@ -44,6 +48,7 @@ substitutions:
   pid_name_min_on_time: "PID Min on time"
   pid_name_min_off_time: "PID Min off time"
   pid_name_reset_integral: "PID Reset integral"
+  pid_name_dew_protection: "PID Dew point protection"
   TAG_ADDON_CLIMATE_PID: nspanel.addon.climate.pid
 
 esphome:
@@ -63,6 +68,28 @@ globals:
     type: float
     restore_value: true
     initial_value: '-${pid_starting_integral}'
+
+  # Dew-point protection: values from Home Assistant (NAN until they report or while unusable), not restored,
+  # so cooling stays blocked after a boot until fresh values have arrived
+  - id: pid_dew_humidity  # Relative humidity in %
+    type: float
+    restore_value: false
+    initial_value: 'NAN'  # Must be quoted: ESPHome expects the C++ initializer as a string
+
+  - id: pid_dew_surface  # Flow or floor temperature in °C
+    type: float
+    restore_value: false
+    initial_value: 'NAN'  # Must be quoted: ESPHome expects the C++ initializer as a string
+
+  - id: pid_dew_blocked  # True while the protection blocks cooling; blocked from the boot when configured
+    type: bool
+    restore_value: false
+    initial_value: 'sizeof("${pid_dew_humidity_entity}") > 1'
+
+  - id: pid_dew_cool_integral  # Cool integral term held while the protection blocks cooling; NAN while not blocked
+    type: float
+    restore_value: false
+    initial_value: 'NAN'  # Must be quoted: ESPHome expects the C++ initializer as a string
 
 climate:
   # The ESPHome PID climate has no direction per mode (heat mode with both outputs would also cool),
@@ -135,6 +162,124 @@ script:
           ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_PID}", "  Min on time: %.0f s", pid_tuning_min_on_time->state);
           ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_PID}", "  Min off time: %.0f s", pid_tuning_min_off_time->state);
           ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_PID}", "  Deadband: %.2f K", pid_tuning_deadband->state);
+          if (sizeof("${pid_dew_humidity_entity}") > 1) {
+            ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_PID}", "  Dew-point protection: %s, margin %.1f K, compared with %s",
+                          "${pid_dew_humidity_entity}", static_cast<float>(${pid_dew_margin}),
+                          sizeof("${pid_dew_surface_entity}") > 1 ? "${pid_dew_surface_entity}" : "the cooling setpoint");
+          } else {
+            ESP_LOGCONFIG("${TAG_ADDON_CLIMATE_PID}", "  Dew-point protection: off");
+          }
+
+  ###################################################################################################
+  ##### Dew-point protection: blocks cooling while the cooling setpoint (or the flow or floor   #####
+  ##### temperature, when configured) is less than pid_dew_margin above the room's dew point.   #####
+  ##### Fail-safe: cooling is also blocked while a value is unknown or Home Assistant is stale.  #####
+  ##### The including package applies it to its outputs by extending pid_dew_changed.          #####
+  ###################################################################################################
+  - id: !extend boot_early_routines
+    then:
+      - lambda: |-
+          // Must run before the API connects: a subscription registered after the initial burst is never sent.
+          // The const char* overload keeps the pointer without copying; string literals live forever.
+          #ifdef USE_API_HOMEASSISTANT_STATES
+          if (sizeof("${pid_dew_humidity_entity}") > 1) {
+            api::global_api_server->subscribe_home_assistant_state(
+                "${pid_dew_humidity_entity}", nullptr, std::function<void(StringRef)>([](StringRef state) {
+                  const auto value = parse_number<float>(state.c_str());
+                  id(pid_dew_humidity) = (value.has_value() && *value > 0.0f && *value <= 100.0f) ? *value : NAN;
+                  pid_dew_check->execute();
+                }));
+          }
+          if (sizeof("${pid_dew_humidity_entity}") > 1 && sizeof("${pid_dew_surface_entity}") > 1) {
+            api::global_api_server->subscribe_home_assistant_state(
+                "${pid_dew_surface_entity}", nullptr, std::function<void(StringRef)>([](StringRef state) {
+                  const auto value = parse_number<float>(state.c_str());
+                  #if NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+                  id(pid_dew_surface) = value.has_value() ? fahrenheit_to_celsius(*value) : NAN;
+                  #else   // Celsius
+                  id(pid_dew_surface) = value.has_value() ? *value : NAN;
+                  #endif  // NSPANEL_EASY_HW_TEMPERATURE_IS_FAHRENHEIT
+                  pid_dew_check->execute();
+                }));
+          }
+          #else   // USE_API_HOMEASSISTANT_STATES
+          if (sizeof("${pid_dew_humidity_entity}") > 1) {
+            ESP_LOGE("${TAG_ADDON_CLIMATE_PID}", "api: homeassistant_states is not enabled; cooling stays blocked");
+          }
+          #endif  // USE_API_HOMEASSISTANT_STATES
+
+  - id: !extend api_stale_changed
+    then:
+      - script.execute: pid_dew_check
+
+  - id: pid_dew_check
+    mode: queued
+    then:
+      - lambda: |-
+          if (sizeof("${pid_dew_humidity_entity}") <= 1) return;  // Protection not configured
+          const float humidity = id(pid_dew_humidity);
+          const float temp = pid_temperature->state;
+          const bool use_surface = (sizeof("${pid_dew_surface_entity}") > 1);
+          const float reference = use_surface ? id(pid_dew_surface) : pid_cool_embedded->target_temperature;
+
+          bool blocked = true;  // Fail-safe: blocked unless all values are known
+          float dew_point = NAN;
+          const char *reason = nullptr;  // Why the dew point is unknown, for the log
+          if (api_stale) {
+            ESP_LOGV("${TAG_ADDON_CLIMATE_PID}", "Dew point: Home Assistant is stale");
+            reason = "Home Assistant is stale";
+          } else if (std::isnan(humidity) || std::isnan(temp) || std::isnan(reference)) {
+            ESP_LOGV("${TAG_ADDON_CLIMATE_PID}", "Dew point: humidity, temperature or %s unknown",
+                     use_surface ? "surface temperature" : "setpoint");
+            reason = use_surface ? "humidity, temperature or surface temperature unknown"
+                                 : "humidity, temperature or setpoint unknown";
+          } else {
+            // Magnus formula over water (Sonntag 1990)
+            constexpr float A = 17.62f;
+            constexpr float B = 243.12f;
+            const float gamma = logf(humidity / 100.0f) + A * temp / (B + temp);
+            dew_point = B * gamma / (A - gamma);
+            // Released only 0.5 K above the threshold, so the valve does not toggle around it
+            const float threshold = dew_point + static_cast<float>(${pid_dew_margin}) + (id(pid_dew_blocked) ? 0.5f : 0.0f);
+            blocked = (reference < threshold);
+          }
+
+          // Anti-windup: while cooling is blocked, the cool controller keeps integrating the room's error.
+          // Its integral may unwind, but not wind beyond its value at the start of the block,
+          // so the valve does not open fully on release.
+          float &held = id(pid_dew_cool_integral);
+          if (id(pid_dew_blocked) || blocked) {
+            if (std::isnan(held)) {
+              // After a boot, the stored term, which pid_integral_track restores at the first sync
+              const bool running = pid_dew_protection->has_state() && pid_cool_embedded->mode != climate::CLIMATE_MODE_OFF;
+              held = running ? pid_cool_embedded->get_integral_term() : id(pid_cool_integral_stored);
+              ESP_LOGD("${TAG_ADDON_CLIMATE_PID}", "Dew-point protection: cool integral held at %.3f", held);
+            } else if (pid_cool_embedded->get_integral_term() < held) {  // Negative while cooling: less is more cooling
+              pid_cool_embedded->set_starting_integral_term(held);
+            }
+          }
+          if (!blocked) held = NAN;
+
+          if (blocked == id(pid_dew_blocked) && pid_dew_protection->has_state()) return;
+          if (blocked && !pid_dew_protection->has_state() && reason != nullptr) {
+            ESP_LOGI("${TAG_ADDON_CLIMATE_PID}", "Dew-point protection: cooling blocked until the values have arrived");
+          } else if (blocked && reason != nullptr) {
+            ESP_LOGW("${TAG_ADDON_CLIMATE_PID}", "Dew-point protection: cooling blocked (%s)", reason);
+          } else if (blocked) {
+            ESP_LOGW("${TAG_ADDON_CLIMATE_PID}", "Dew-point protection: cooling blocked (dew point %.1f°C, %s %.1f°C)",
+                     dew_point, use_surface ? "surface" : "setpoint", reference);
+          } else {
+            ESP_LOGI("${TAG_ADDON_CLIMATE_PID}", "Dew-point protection: cooling released (dew point %.1f°C, %s %.1f°C)",
+                     dew_point, use_surface ? "surface" : "setpoint", reference);
+          }
+          id(pid_dew_blocked) = blocked;
+          pid_dew_protection->publish_state(blocked);
+          pid_dew_changed->execute();
+
+  # Applies a change of pid_dew_blocked to the outputs and the display; extended by the including package
+  - id: pid_dew_changed
+    mode: queued
+    then:
 
   # Keeps each controller's integral term while it is off: stores it when the controller switches off,
   # and restores it when it switches on, which includes the first sync after a boot.
@@ -198,6 +343,10 @@ interval:
                                                  static_cast<uint32_t>(min_off_s * 1000.0f))) {
             pid_pwm_apply->execute();
           }
+
+  - interval: ${pid_sync_interval}s  # Follows the room temperature and the setpoint
+    then:
+      - script.execute: pid_dew_check
 
   # Saves the integral term of each running controller, so a reboot continues from it.
   # Every 30 minutes, to keep flash writes low; a slow system's integral changes little in that time.
@@ -362,6 +511,14 @@ number:
           pid_cool_embedded->set_threshold_high(x);
           pid_cool_embedded->set_threshold_low(-x);
 
+binary_sensor:
+  - platform: template  # On while the dew-point protection blocks cooling; hidden from HA when not configured
+    id: pid_dew_protection
+    name: ${pid_name_dew_protection}
+    icon: mdi:snowflake-alert
+    device_class: problem
+    internal: ${pid_dew_humidity_entity == ""}
+
 button:
   - platform: template
     name: ${pid_name_reset_integral}
@@ -373,6 +530,7 @@ button:
       - lambda: |-
           id(pid_heat_integral_stored) = 0.0f;
           id(pid_cool_integral_stored) = 0.0f;
+          if (!std::isnan(id(pid_dew_cool_integral))) id(pid_dew_cool_integral) = 0.0f;  // Dew-point protection holds 0
 
 packages:
   climate_base_package: !include nspanel_esphome_addon_climate_base.yaml
